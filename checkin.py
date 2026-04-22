@@ -5,7 +5,9 @@ import sys
 # ======================
 #  读取环境变量
 # ======================
-GLADOS_COOKIES = os.getenv("GLADOS", "").strip()   # 多账号用换行分隔
+GLADOS_COOKIES     = os.getenv("GLADOS", "").strip()        # 多账号用换行分隔
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 UA = "Mozilla/4.0 (compatible; MSIE 7.0; Windows NT 6.0)"
 
@@ -13,26 +15,56 @@ CHECKIN_URL = "https://railgun.info/api/user/checkin"
 STATUS_URL  = "https://railgun.info/api/user/status"
 REFERER     = "https://railgun.info/console/checkin"
 
-
-# 视为“签到流程正常结束”的关键词（包括重复签到）
+# 视为"签到流程正常结束"的关键词（包括重复签到）
 SUCCESS_KEYWORDS = [
-    "Checkin! Got",                             # 成功获得点数
-    "Checkin Repeats! Please Try Tomorrow",     # 旧版重复签到提示
-    "Today's observation logged. Return tomorrow for more points.", # 新版重复签到提示
+    "Checkin! Got",
+    "Checkin Repeats! Please Try Tomorrow",
+    "Today's observation logged. Return tomorrow for more points.",
 ]
 
 
+# ======================
+#  Telegram 通知
+# ======================
+def send_telegram(text: str) -> None:
+    """向 Telegram 发送消息，失败时仅打印警告，不影响主流程。"""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("[TG] 未配置 TELEGRAM_BOT_TOKEN 或 TELEGRAM_CHAT_ID，跳过通知")
+        return
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML",          # 支持 <b> <i> <code> 等标签
+    }
+    try:
+        resp = requests.post(url, json=payload, timeout=10)
+        resp.raise_for_status()
+        print("[TG] 消息发送成功")
+    except Exception as e:
+        print(f"[TG] 消息发送失败（不影响签到结果）: {e}")
+
+
+# ======================
+#  签到主逻辑
+# ======================
 def glados_checkin():
     if not GLADOS_COOKIES:
-        print("未设置 GLADOS 环境变量，跳过签到")
+        msg = "⚠️ 未设置 GLADOS 环境变量，跳过签到"
+        print(msg)
+        send_telegram(msg)
         return
 
     cookies_list = [c.strip() for c in GLADOS_COOKIES.split("\n") if c.strip()]
 
-    has_real_error = False  # 标记是否有真正失败的账号
+    has_real_error = False
+    # 收集每个账号的结果，最后汇总发送
+    summary_lines: list[str] = ["<b>🚀 Railgun 签到报告</b>"]
 
     for idx, cookie in enumerate(cookies_list, 1):
         print(f"\n===== 账号 {idx} =====")
+        summary_lines.append(f"\n<b>账号 {idx}</b>")
 
         headers = {
             "cookie": cookie,
@@ -42,29 +74,27 @@ def glados_checkin():
         }
 
         try:
-            # 1. 签到
+            # ── 1. 签到 ──────────────────────────────────────────
             checkin_resp = requests.post(
                 CHECKIN_URL,
                 headers=headers,
                 json={"token": "railgun.info"},
-                timeout=15
+                timeout=15,
             )
             checkin_resp.raise_for_status()
             action = checkin_resp.json()
 
             message = action.get("message", "").strip()
-            code = action.get("code")
+            code    = action.get("code")
 
-            # 打印原始返回，便于调试
             print(f"签到返回 code={code} | message={message}")
 
-            # 判断是否属于“正常结束”范畴
             is_success = code == 0 or any(kw in message for kw in SUCCESS_KEYWORDS)
 
             if not is_success:
                 raise ValueError(f"签到失败（非重复）: code={code} message={message}")
 
-            # 2. 获取剩余天数（即使重复签到也尽量获取）
+            # ── 2. 获取剩余天数 ───────────────────────────────────
             try:
                 status_resp = requests.get(STATUS_URL, headers=headers, timeout=10)
                 status_resp.raise_for_status()
@@ -76,20 +106,41 @@ def glados_checkin():
 
                 print(f"签到结果: {message}")
                 print(f"剩余天数: {left_days}")
+
+                summary_lines.append(f"✅ {message}")
+                summary_lines.append(f"⏳ 剩余天数: <code>{left_days}</code>")
+
             except Exception as e:
                 print(f"获取状态失败，但签到已算正常: {e}")
+                summary_lines.append(f"✅ {message}")
+                summary_lines.append(f"⚠️ 获取状态失败: {e}")
 
         except requests.exceptions.RequestException as e:
-            print(f"网络请求失败: {e}")
-            has_real_error = True
-        except ValueError as e:
-            print(f"签到异常: {e}")
-            has_real_error = True
-        except Exception as e:
-            print(f"其他错误: {type(e).__name__}: {e}")
+            err = f"网络请求失败: {e}"
+            print(err)
+            summary_lines.append(f"❌ {err}")
             has_real_error = True
 
-    # 最后统一决定退出码：只要有一个账号真正失败，就让 Actions 失败（发邮件）
+        except ValueError as e:
+            err = f"签到异常: {e}"
+            print(err)
+            summary_lines.append(f"❌ {err}")
+            has_real_error = True
+
+        except Exception as e:
+            err = f"其他错误: {type(e).__name__}: {e}"
+            print(err)
+            summary_lines.append(f"❌ {err}")
+            has_real_error = True
+
+    # ── 汇总通知 ─────────────────────────────────────────────────
+    if has_real_error:
+        summary_lines.append("\n🔴 <b>存在账号签到失败，请检查日志！</b>")
+    else:
+        summary_lines.append("\n🟢 <b>所有账号签到流程正常结束</b>")
+
+    send_telegram("\n".join(summary_lines))
+
     if has_real_error:
         print("\n存在至少一个账号签到真正失败 → 设置退出码 1 以触发通知")
         sys.exit(1)
