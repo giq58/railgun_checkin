@@ -97,6 +97,51 @@ def glados_checkin():
         print("\n签到成功！所有账号签到流程正常结束")
         sys.exit(0)
 
+    def send_notification(self, results):
+        """发送汇总通知到Telegram - 按照指定模板格式"""
+        if not self.telegram_bot_token or not self.telegram_chat_id:
+            logger.info("Telegram配置未设置，跳过通知")
+            return
+        
+        try:
+            # 构建通知消息
+            success_count = sum(1 for _, success, _, _ in results if success)
+            total_count = len(results)
+            current_date = datetime.now().strftime("%Y/%m/%d")
+            
+            message = f"🎁 Leaflow自动签到通知\n"
+            message += f"📊 成功: {success_count}/{total_count}\n"
+            message += f"📅 签到时间：{current_date}\n\n"
+            
+            for email, success, result, balance in results:
+                # 隐藏邮箱部分字符以保护隐私
+                masked_email = email[:3] + "***" + email[email.find("@"):]
+                
+                if success:
+                    status = "✅"
+                    message += f"账号：{masked_email}\n"
+                    message += f"{status}  {result}！\n"
+                    message += f"💰  当前总余额：{balance}。\n\n"
+                else:
+                    status = "❌"
+                    message += f"账号：{masked_email}\n"
+                    message += f"{status}  {result}\n\n"
+            
+            url = f"https://api.telegram.org/bot{self.telegram_bot_token}/sendMessage"
+            data = {
+                "chat_id": self.telegram_chat_id,
+                "text": message,
+                "parse_mode": "HTML"
+            }
+            
+            response = requests.post(url, data=data, timeout=10)
+            if response.status_code == 200:
+                logger.info("Telegram汇总通知发送成功")
+            else:
+                logger.error(f"Telegram通知发送失败: {response.text}")
+                
+        except Exception as e:
+            logger.error(f"发送Telegram通知时出错: {e}")
 
 def main():
     glados_checkin()
